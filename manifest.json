@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.stamatim.omawix",
+  "name": "Omawix",
+  "version": "0.2.0",
+  "author": "stamatim",
+  "license": "MIT",
+  "homepage": "https://github.com/stamatim/omawix",
+  "repository": "https://github.com/stamatim/omawix",
+  "keywords": [
+    "kiwix",
+    "zim",
+    "offline",
+    "library"
+  ],
+  "description": "Browse the ZIM catalog, manage downloads and storage, and read offline content in an embedded reader.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omawix",
+    "description": "Local ZIM archive status and quick access to the Omawix manager and reader.",
+    "category": "Education",
+    "aliases": [
+      "kiwix",
+      "zim"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 60,
+      "maxItems": 8
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 10,
+        "max": 3600,
+        "step": 10,
+        "defaultValue": 60
+      },
+      {
+        "key": "maxItems",
+        "type": "integer",
+        "label": "Archives in panel",
+        "min": 3,
+        "max": 20,
+        "step": 1,
+        "defaultValue": 8
+      }
+    ]
+  }
+}

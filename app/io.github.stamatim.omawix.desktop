@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Omawix
+GenericName=Offline Library Manager and Reader
+Comment=Browse the catalog, download and manage ZIM archives, and read offline
+Icon=io.github.stamatim.omawix
+Exec=omawix %f
+TryExec=omawix
+Terminal=false
+MimeType=application/x-openzim;
+Keywords=zim;offline;wikipedia;catalog;reader;downloads;library;
+Categories=Education;Utility;
+StartupNotify=true

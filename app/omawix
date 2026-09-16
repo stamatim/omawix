@@ -1,0 +1,1043 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import re
+import sys
+import threading
+import tomllib
+import urllib.parse
+from dataclasses import asdict
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lib"))
+
+from omawix_catalog import CatalogClient
+from omawix_downloads import DownloadError, DownloadManager
+from omawix_library import (
+    APP_ID,
+    add_library_dir,
+    collect_library,
+    load_config,
+    remove_library_dir,
+    set_download_dir,
+    trash_archive,
+)
+from omawix_reader import ReaderServer
+from omawix_state import StateStore
+
+
+def format_bytes(value: int | float) -> str:
+    size = max(0.0, float(value or 0))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    index = 0
+    while size >= 1000 and index < len(units) - 1:
+        size /= 1000
+        index += 1
+    decimals = 0 if size >= 100 or index == 0 else (1 if size >= 10 else 2)
+    number = f"{size:.{decimals}f}"
+    if "." in number:
+        number = number.rstrip("0").rstrip(".")
+    return f"{number} {units[index]}"
+
+
+def format_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "--"
+    minutes, second = divmod(max(0, seconds), 60)
+    hours, minute = divmod(minutes, 60)
+    return f"{hours}h {minute}m" if hours else f"{minute}m {second}s"
+
+
+def resolve_command_line_path(value: str, cwd: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path(cwd) / path
+    return path.resolve()
+
+
+def run_gui() -> int:
+    import gi
+
+    gi.require_version("Gdk", "4.0")
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Pango", "1.0")
+    gi.require_version("WebKit", "6.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk, Pango, WebKit
+
+    theme_root = Path.home() / ".local/state/omarchy/current"
+
+    def read_toml(path: Path) -> dict:
+        try:
+            with path.open("rb") as handle:
+                return tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            return {}
+
+    def valid_color(value: object, fallback: str) -> str:
+        text = str(value or "")
+        return text if re.fullmatch(r"#[0-9A-Fa-f]{6}", text) else fallback
+
+    def theme_css() -> bytes:
+        colors = read_toml(theme_root / "theme/colors.toml")
+        background = valid_color(colors.get("background"), "#101315")
+        surface = valid_color(colors.get("dark_background"), "#181825")
+        foreground = valid_color(colors.get("foreground"), "#cacccc")
+        muted = valid_color(colors.get("muted"), "#73777a")
+        accent = valid_color(colors.get("accent") or colors.get("blue"), "#7aa2f7")
+        urgent = valid_color(colors.get("bright_red") or colors.get("red"), "#f7768e")
+        return f"""
+          @define-color oma_bg {background};
+          @define-color oma_surface {surface};
+          @define-color oma_fg {foreground};
+          @define-color oma_muted {muted};
+          @define-color oma_accent {accent};
+          @define-color oma_urgent {urgent};
+          window {{ background: @oma_bg; color: @oma_fg; font-family: monospace; }}
+          .chrome {{ min-height: 40px; padding: 0 10px; background: @oma_surface;
+                     border-bottom: 1px solid alpha(@oma_fg, .12); }}
+          .brand {{ color: @oma_accent; font-weight: 800; letter-spacing: 1.4px; }}
+          .nav-button, .action-button {{ min-height: 26px; padding: 3px 9px;
+                     background: transparent; color: @oma_muted; border-radius: 4px; }}
+          .nav-button:hover, .action-button:hover {{ background: alpha(@oma_fg, .08); color: @oma_fg; }}
+          .nav-button.active {{ color: @oma_accent; background: alpha(@oma_accent, .12); }}
+          .primary {{ color: @oma_accent; border-color: alpha(@oma_accent, .45); }}
+          .danger {{ color: @oma_urgent; }}
+          .search {{ min-height: 28px; background: @oma_bg; color: @oma_fg;
+                     border: 1px solid alpha(@oma_fg, .18); border-radius: 4px; }}
+          .sidebar {{ background: @oma_surface; border-right: 1px solid alpha(@oma_fg, .12); }}
+          .section {{ color: @oma_muted; font-size: 11px; font-weight: 700;
+                      letter-spacing: 1.2px; }}
+          .content-row {{ min-height: 64px; padding: 8px 12px; background: transparent;
+                          border-bottom: 1px solid alpha(@oma_fg, .07); }}
+          .content-row:hover {{ background: alpha(@oma_fg, .06); }}
+          .title {{ font-weight: 700; }}
+          .meta {{ color: @oma_muted; font-size: 11px; }}
+          .status {{ min-height: 30px; padding: 0 12px; background: @oma_surface;
+                     border-top: 1px solid alpha(@oma_fg, .12); color: @oma_muted; }}
+          .error {{ color: @oma_urgent; }}
+          .empty {{ color: @oma_muted; padding: 70px 24px; }}
+          progressbar trough {{ min-height: 4px; background: alpha(@oma_fg, .12); }}
+          progressbar progress {{ background: @oma_accent; }}
+        """.encode()
+
+    def clear_children(container: Gtk.Widget) -> None:
+        while child := container.get_first_child():
+            container.remove(child)
+
+    def label(text: str, css: str | None = None, *, ellipsize: bool = False) -> Gtk.Label:
+        widget = Gtk.Label(label=text, xalign=0)
+        if css:
+            widget.add_css_class(css)
+        if ellipsize:
+            widget.set_ellipsize(Pango.EllipsizeMode.END)
+        return widget
+
+    def button(text: str, callback, css: str | None = None) -> Gtk.Button:
+        widget = Gtk.Button(label=text)
+        widget.add_css_class("action-button")
+        if css:
+            widget.add_css_class(css)
+        widget.connect("clicked", callback)
+        return widget
+
+    class ArchiveRow(Gtk.ListBoxRow):
+        def __init__(self, book: dict, open_callback, trash_callback):
+            super().__init__()
+            self.book = book
+            self.search_text = " ".join(
+                str(book.get(key, ""))
+                for key in ("title", "description", "filename", "language", "edition")
+            ).casefold()
+            self.add_css_class("content-row")
+            self.set_tooltip_text(book["path"])
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            mark = label("K", "brand")
+            mark.set_size_request(24, -1)
+            row.append(mark)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            text.set_hexpand(True)
+            text.append(label(book.get("title") or book["filename"], "title", ellipsize=True))
+            detail = " · ".join(
+                item for item in (
+                    str(book.get("language") or ""),
+                    str(book.get("edition") or book.get("date") or ""),
+                    format_bytes(book.get("sizeBytes", 0)),
+                    str(book.get("origin", "external")).upper(),
+                ) if item
+            )
+            text.append(label(detail, "meta", ellipsize=True))
+            row.append(text)
+            row.append(button("OPEN", lambda _b: open_callback(book), "primary"))
+            row.append(button("TRASH", lambda _b: trash_callback(book), "danger"))
+            self.set_child(row)
+
+    class CatalogRow(Gtk.ListBoxRow):
+        def __init__(self, entry, state: str, download_callback):
+            super().__init__()
+            self.entry = entry
+            self.add_css_class("content-row")
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            text.set_hexpand(True)
+            text.append(label(entry.title, "title", ellipsize=True))
+            text.append(label(entry.summary or entry.name, "meta", ellipsize=True))
+            details = " · ".join(
+                item for item in (
+                    ", ".join(entry.languages), entry.flavour, entry.category,
+                    format_bytes(entry.sizeBytes), entry.issued[:10],
+                ) if item
+            )
+            text.append(label(details, "meta", ellipsize=True))
+            row.append(text)
+            if state:
+                status = label(state.upper(), "meta")
+                status.set_size_request(105, -1)
+                row.append(status)
+            else:
+                download = button("DOWNLOAD", lambda _b: download_callback(entry), "primary")
+                download.set_sensitive(bool(entry.downloadUrl))
+                row.append(download)
+            self.set_child(row)
+
+    class DownloadRow(Gtk.ListBoxRow):
+        def __init__(self, state: dict, action_callback, open_callback):
+            super().__init__()
+            self.state = state
+            self.add_css_class("content-row")
+            metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+            title_text = str(metadata.get("title") or state.get("catalog_id") or "Download")
+            status_text = str(state.get("status") or "queued")
+            completed = int(state.get("completed_bytes") or 0)
+            total = int(state.get("total_bytes") or state.get("required_bytes") or 0)
+            speed = int(state.get("speed_bytes_per_second") or 0)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            content.set_hexpand(True)
+            content.append(label(title_text, "title", ellipsize=True))
+            details = f"{status_text.upper()} · {format_bytes(completed)} / {format_bytes(total)}"
+            if speed:
+                details += f" · {format_bytes(speed)}/s"
+            if state.get("error"):
+                details += f" · {state['error']}"
+            content.append(label(details, "error" if state.get("error") else "meta", ellipsize=True))
+            progress = Gtk.ProgressBar()
+            progress.set_fraction(min(1.0, completed / total) if total else 0.0)
+            content.append(progress)
+            row.append(content)
+            catalog_id = str(state.get("catalog_id") or "")
+            if status_text in {"queued", "downloading"}:
+                row.append(button("PAUSE", lambda _b: action_callback("pause", catalog_id)))
+                row.append(button("CANCEL", lambda _b: action_callback("cancel", catalog_id), "danger"))
+            elif status_text == "paused":
+                row.append(button("RESUME", lambda _b: action_callback("resume", catalog_id), "primary"))
+                row.append(button("CANCEL", lambda _b: action_callback("cancel", catalog_id), "danger"))
+            elif status_text == "error":
+                row.append(button("RETRY", lambda _b: action_callback("retry", catalog_id), "primary"))
+                row.append(button("REMOVE", lambda _b: action_callback("cancel", catalog_id), "danger"))
+            elif status_text == "completed":
+                paths = state.get("paths") if isinstance(state.get("paths"), list) else []
+                if paths:
+                    row.append(button("OPEN", lambda _b: open_callback({"path": paths[0]}), "primary"))
+            self.set_child(row)
+
+    class OmawixWindow(Gtk.ApplicationWindow):
+        def __init__(self, app: Gtk.Application):
+            super().__init__(application=app, title="Omawix")
+            self.set_default_size(1080, 760)
+            self.state_store = StateStore()
+            self.catalog = CatalogClient(self.state_store)
+            self.download_manager: DownloadManager | None = None
+            self.download_lock = threading.RLock()
+            self.download_polling = False
+            self.reader_server: ReaderServer | None = None
+            self.reader_generation = 0
+            self.library_generation = 0
+            self.catalog_generation = 0
+            self.catalog_start = 0
+            self.catalog_count = 50
+            self.catalog_loaded = False
+            self.books: list[dict] = []
+            self.library_payload: dict = {}
+            self.active_location: str | None = None
+            self.mode = "library"
+            self.search_source = 0
+
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.set_child(root)
+            self.header = Gtk.HeaderBar()
+            self.header.set_show_title_buttons(True)
+            self.header.add_css_class("chrome")
+            self.header.pack_start(label("K  OMAWIX", "brand"))
+            nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+            self.nav_buttons = {}
+            for key, title in (("library", "LIBRARY"), ("explore", "EXPLORE"), ("downloads", "DOWNLOADS")):
+                item = Gtk.Button(label=title)
+                item.add_css_class("nav-button")
+                item.connect("clicked", lambda _button, name=key: self.show_mode(name))
+                nav.append(item)
+                self.nav_buttons[key] = item
+            self.header.pack_start(nav)
+            self.search = Gtk.SearchEntry(placeholder_text="Search library")
+            self.search.set_size_request(340, -1)
+            self.search.add_css_class("search")
+            self.search.connect("search-changed", self._search_changed)
+            self.search.connect("activate", lambda _entry: self._search_now())
+            self.header.set_title_widget(self.search)
+            root.append(self.header)
+
+            self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+            self.stack.set_vexpand(True)
+            root.append(self.stack)
+            self._build_library_view()
+            self._build_explore_view()
+            self._build_downloads_view()
+            self._build_reader_view()
+
+            keys = Gtk.EventControllerKey()
+            keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            keys.connect("key-pressed", self._key_pressed)
+            self.add_controller(keys)
+
+            self.show_mode("library")
+            self.refresh_library()
+            self.download_timer = GLib.timeout_add_seconds(1, self._poll_downloads)
+
+        def _build_library_view(self) -> None:
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            toolbar.set_margin_start(10)
+            toolbar.set_margin_end(10)
+            toolbar.set_margin_top(8)
+            toolbar.set_margin_bottom(8)
+            toolbar.append(button("+ FOLDER", self._choose_folder))
+            toolbar.append(button("DOWNLOAD LOCATION", self._choose_download_folder))
+            toolbar.append(button("REMOVE LOCATION", self._remove_selected_location, "danger"))
+            toolbar.append(button("REFRESH", lambda _b: self.refresh_library()))
+            page.append(toolbar)
+            body = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+            body.set_vexpand(True)
+            sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            sidebar.set_size_request(235, -1)
+            sidebar.add_css_class("sidebar")
+            heading = label("LOCATIONS", "section")
+            heading.set_margin_start(12)
+            heading.set_margin_top(12)
+            sidebar.append(heading)
+            self.location_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+            self.location_list.connect("row-selected", self._location_selected)
+            sidebar.append(self.location_list)
+            body.set_start_child(sidebar)
+            scroller = Gtk.ScrolledWindow()
+            self.library_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            self.library_list.set_filter_func(self._filter_library_row)
+            scroller.set_child(self.library_list)
+            body.set_end_child(scroller)
+            page.append(body)
+            self.library_status = label("Scanning library", "status")
+            page.append(self.library_status)
+            self.stack.add_named(page, "library")
+
+        def _build_explore_view(self) -> None:
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            controls.set_margin_start(10)
+            controls.set_margin_end(10)
+            controls.set_margin_top(8)
+            controls.set_margin_bottom(8)
+            self.language_filter = Gtk.Entry(placeholder_text="Language code, e.g. eng")
+            self.language_filter.set_size_request(190, -1)
+            self.category_filter = Gtk.Entry(placeholder_text="Category, e.g. wikipedia")
+            self.category_filter.set_size_request(220, -1)
+            self.size_filter = Gtk.Entry(placeholder_text="Max GB")
+            self.size_filter.set_size_request(90, -1)
+            controls.append(self.language_filter)
+            controls.append(self.category_filter)
+            controls.append(self.size_filter)
+            controls.append(button("APPLY", lambda _b: self.refresh_catalog(reset=True), "primary"))
+            controls.append(button("CLEAR", self._clear_catalog_filters))
+            self.previous_button = button("PREVIOUS", lambda _b: self._catalog_page(-1))
+            self.next_button = button("NEXT", lambda _b: self._catalog_page(1))
+            controls.append(self.previous_button)
+            controls.append(self.next_button)
+            page.append(controls)
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_vexpand(True)
+            scroller.set_hexpand(True)
+            scroller.set_propagate_natural_height(False)
+            scroller.set_min_content_height(120)
+            self.catalog_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            scroller.set_child(self.catalog_list)
+            page.append(scroller)
+            self.catalog_status = label("Open Explore to load the Kiwix catalog", "status")
+            page.append(self.catalog_status)
+            self.stack.add_named(page, "explore")
+
+        def _build_downloads_view(self) -> None:
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            heading.set_margin_start(10)
+            heading.set_margin_end(10)
+            heading.set_margin_top(8)
+            heading.set_margin_bottom(8)
+            heading.append(label("TRANSFER QUEUE", "section"))
+            heading.append(button("REFRESH", lambda _b: self.refresh_downloads()))
+            page.append(heading)
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_vexpand(True)
+            scroller.set_hexpand(True)
+            scroller.set_propagate_natural_height(False)
+            scroller.set_min_content_height(120)
+            self.download_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            scroller.set_child(self.download_list)
+            page.append(scroller)
+            self.download_status = label("No downloads", "status")
+            page.append(self.download_status)
+            self.stack.add_named(page, "downloads")
+
+        def _build_reader_view(self) -> None:
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            toolbar.set_margin_start(8)
+            toolbar.set_margin_end(8)
+            toolbar.set_margin_top(6)
+            toolbar.set_margin_bottom(6)
+            toolbar.append(button("←", lambda _b: self.reader.go_back(), "primary"))
+            toolbar.append(button("→", lambda _b: self.reader.go_forward(), "primary"))
+            toolbar.append(button("HOME", self._reader_home))
+            toolbar.append(button("RELOAD", lambda _b: self.reader.reload()))
+            toolbar.append(button("LIBRARY", lambda _b: self._leave_reader()))
+            self.reader_title = label("READER", "section", ellipsize=True)
+            self.reader_title.set_hexpand(True)
+            toolbar.append(self.reader_title)
+            page.append(toolbar)
+            self.reader_session = WebKit.NetworkSession.new_ephemeral()
+            proxy = WebKit.NetworkProxySettings.new(
+                "http://127.0.0.1:9", ["127.0.0.1", "localhost"]
+            )
+            self.reader_session.set_proxy_settings(WebKit.NetworkProxyMode.CUSTOM, proxy)
+            content_policy = (
+                "default-src 'self' data: blob:; connect-src 'self'; "
+                "img-src 'self' data: blob:; media-src 'self' data: blob:; "
+                "style-src 'self' 'unsafe-inline'; "
+                "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+                "frame-src 'self' data: blob:; object-src 'self' data:"
+            )
+            self.reader = WebKit.WebView(
+                network_session=self.reader_session,
+                default_content_security_policy=content_policy,
+            )
+            self.reader.set_vexpand(True)
+            self.reader.connect("decide-policy", self._reader_policy)
+            self.reader.connect("load-failed", self._reader_load_failed)
+            page.append(self.reader)
+            self.reader_status = label("Select an archive to read", "status")
+            page.append(self.reader_status)
+            self.stack.add_named(page, "reader")
+
+        def show_mode(self, mode: str) -> None:
+            if self.mode == "reader" and mode != "reader":
+                self._teardown_reader()
+            self.mode = mode
+            self.stack.set_visible_child_name(mode)
+            for name, item in self.nav_buttons.items():
+                item.remove_css_class("active")
+                if name == mode:
+                    item.add_css_class("active")
+            if mode == "library":
+                self.search.set_placeholder_text("Search offline library")
+                self._refresh_library_filter()
+            elif mode == "explore":
+                self.search.set_placeholder_text("Search available wikis")
+                if not self.catalog_loaded:
+                    self.refresh_catalog(reset=True)
+            elif mode == "downloads":
+                self.search.set_placeholder_text("Downloads are shown below")
+                self.refresh_downloads()
+
+        def refresh_library(self) -> None:
+            self.library_generation += 1
+            generation = self.library_generation
+            self.library_status.set_label("Scanning library…")
+
+            def worker() -> None:
+                try:
+                    payload = collect_library()
+                except Exception as error:
+                    payload = {"books": [], "errors": [str(error)], "libraryDirs": []}
+                GLib.idle_add(self._apply_library, generation, payload)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _apply_library(self, generation: int, payload: dict) -> bool:
+            if generation != self.library_generation:
+                return GLib.SOURCE_REMOVE
+            self.library_payload = payload
+            self.books = list(payload.get("books", []))
+            clear_children(self.library_list)
+            for book in self.books:
+                self.library_list.append(ArchiveRow(book, self.open_book, self._confirm_trash))
+            self._rebuild_locations(payload)
+            errors = payload.get("errors") or []
+            status = f"{len(self.books)} archives · {format_bytes(payload.get('totalBytes', 0))}"
+            if errors:
+                status += f" · SCAN INCOMPLETE: {errors[0]}"
+                self.library_status.add_css_class("error")
+            else:
+                self.library_status.remove_css_class("error")
+            if not payload.get("readerAvailable", False):
+                status += " · kiwix-serve unavailable"
+            self.library_status.set_label(status)
+            self._refresh_library_filter()
+            return GLib.SOURCE_REMOVE
+
+        def _rebuild_locations(self, payload: dict) -> None:
+            selected_path = self.active_location
+            self.location_list.disconnect_by_func(self._location_selected)
+            clear_children(self.location_list)
+            all_row = Gtk.ListBoxRow()
+            all_row.location_path = None
+            all_row.set_child(label(f"All archives  {len(self.books)}"))
+            self.location_list.append(all_row)
+            stats = {item.get("path"): item for item in payload.get("libraryStats", [])}
+            selected = all_row
+            for raw_path in payload.get("libraryDirs", []):
+                path = Path(raw_path)
+                count = sum(1 for book in self.books if Path(book["path"]).is_relative_to(path))
+                stat_data = stats.get(raw_path, {})
+                detail = f"{count} · {format_bytes(stat_data.get('freeBytes') or 0)} free"
+                row = Gtk.ListBoxRow()
+                row.location_path = raw_path
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+                box.set_margin_start(10)
+                box.set_margin_end(8)
+                box.set_margin_top(5)
+                box.set_margin_bottom(5)
+                box.append(label(path.name or raw_path, ellipsize=True))
+                box.append(label(detail, "meta", ellipsize=True))
+                row.set_child(box)
+                row.set_tooltip_text(raw_path)
+                self.location_list.append(row)
+                if raw_path == selected_path:
+                    selected = row
+            self.location_list.connect("row-selected", self._location_selected)
+            self.location_list.select_row(selected)
+
+        def _location_selected(self, _listbox, row) -> None:
+            self.active_location = getattr(row, "location_path", None) if row else None
+            self._refresh_library_filter()
+
+        def _filter_library_row(self, row: ArchiveRow) -> bool:
+            query = self.search.get_text().strip().casefold() if self.mode == "library" else ""
+            if query and query not in row.search_text:
+                return False
+            if self.active_location:
+                return Path(row.book["path"]).is_relative_to(Path(self.active_location))
+            return True
+
+        def _refresh_library_filter(self) -> None:
+            if hasattr(self, "library_list"):
+                self.library_list.invalidate_filter()
+
+        def _choose_folder(self, _button) -> None:
+            dialog = Gtk.FileDialog(title="Add a ZIM library folder")
+            dialog.select_folder(self, None, self._folder_selected)
+
+        def _folder_selected(self, dialog, result) -> None:
+            try:
+                folder = dialog.select_folder_finish(result)
+            except GLib.Error:
+                return
+            if folder.get_path() and add_library_dir(Path(folder.get_path())):
+                self.refresh_library()
+
+        def _choose_download_folder(self, _button) -> None:
+            dialog = Gtk.FileDialog(title="Choose the download location")
+            dialog.select_folder(self, None, self._download_folder_selected)
+
+        def _download_folder_selected(self, dialog, result) -> None:
+            try:
+                folder = dialog.select_folder_finish(result)
+            except GLib.Error:
+                return
+            if folder.get_path() and set_download_dir(Path(folder.get_path())):
+                self.refresh_library()
+
+        def _remove_selected_location(self, _button) -> None:
+            row = self.location_list.get_selected_row()
+            path = getattr(row, "location_path", None) if row else None
+            if not path:
+                return
+            if not remove_library_dir(Path(path)):
+                self._show_error("Location cannot be removed", "The active download location must remain in the library.")
+                return
+            self.active_location = None
+            self.refresh_library()
+
+        def _confirm_trash(self, book: dict) -> None:
+            dialog = Gtk.AlertDialog(
+                message="Move archive to trash?",
+                detail=f"{book.get('title') or book['filename']} and all matching split parts will be moved to the desktop trash.",
+                buttons=["Cancel", "Move to Trash"],
+                cancel_button=0,
+                default_button=1,
+            )
+            dialog.choose(self, None, self._trash_confirmed, book)
+
+        def _trash_confirmed(self, dialog, result, book: dict) -> None:
+            try:
+                accepted = dialog.choose_finish(result) == 1
+            except GLib.Error:
+                return
+            if not accepted:
+                return
+            if self.reader_server and self.reader_server.archive_path == Path(book["path"]).resolve():
+                self._leave_reader()
+
+            def worker() -> None:
+                try:
+                    trashed = trash_archive(
+                        book["path"],
+                        lambda path: Gio.File.new_for_path(str(path)).trash(None),
+                    )
+                except Exception as error:
+                    GLib.idle_add(self._show_error, "Could not trash archive", str(error))
+                    GLib.idle_add(self.refresh_library)
+                else:
+                    GLib.idle_add(
+                        self._archive_trashed, [str(path.resolve()) for path in trashed]
+                    )
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _archive_trashed(self, trashed_paths: list[str]) -> bool:
+            removed = set(trashed_paths)
+            for state in self.state_store.list_download_states():
+                known_paths = state.get("output_paths") or state.get("paths") or []
+                if not isinstance(known_paths, list):
+                    continue
+                if removed.intersection(str(Path(path).resolve()) for path in known_paths):
+                    catalog_id = str(state.get("catalog_id") or "")
+                    if catalog_id:
+                        self.state_store.delete_download_state(catalog_id)
+                    metalink_path = state.get("metalink_path")
+                    if isinstance(metalink_path, str):
+                        try:
+                            Path(metalink_path).unlink()
+                        except FileNotFoundError:
+                            pass
+            self.refresh_downloads()
+            self.refresh_library()
+            if self.catalog_loaded:
+                self.refresh_catalog()
+            return GLib.SOURCE_REMOVE
+
+        def refresh_catalog(self, *, reset: bool = False) -> None:
+            if reset:
+                self.catalog_start = 0
+            self.catalog_generation += 1
+            generation = self.catalog_generation
+            self.catalog_status.set_label("Loading catalog…")
+            query = self.search.get_text().strip()
+            language = self.language_filter.get_text().strip()
+            category = self.category_filter.get_text().strip()
+            size_text = self.size_filter.get_text().strip()
+            try:
+                maxsize = int(float(size_text) * 1_000_000_000) if size_text else None
+                if maxsize is not None and maxsize < 0:
+                    raise ValueError
+            except ValueError:
+                self._show_error(
+                    "Invalid size filter", "Maximum size must be a positive number of GB."
+                )
+                return
+            start = self.catalog_start
+
+            def worker() -> None:
+                try:
+                    page = self.catalog.fetch_entries(
+                        q=query or None,
+                        lang=language or None,
+                        category=category or None,
+                        maxsize=maxsize,
+                        start=start,
+                        count=self.catalog_count,
+                    )
+                    error = None
+                except Exception as failure:
+                    page = None
+                    error = str(failure)
+                GLib.idle_add(self._apply_catalog, generation, page, error)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _apply_catalog(self, generation: int, page, error: str | None) -> bool:
+            if generation != self.catalog_generation:
+                return GLib.SOURCE_REMOVE
+            clear_children(self.catalog_list)
+            if error or page is None:
+                self.catalog_status.set_label(f"CATALOG ERROR · {error}")
+                self.catalog_status.add_css_class("error")
+                return GLib.SOURCE_REMOVE
+            self.catalog_loaded = True
+            self.catalog_status.remove_css_class("error")
+            for entry in page.entries:
+                self.catalog_list.append(
+                    CatalogRow(entry, self._catalog_entry_state(entry), self._start_download)
+                )
+            first = self.catalog_start + 1 if page.entries else 0
+            last = self.catalog_start + len(page.entries)
+            cache = " · OFFLINE CACHE" if page.from_cache else ""
+            self.catalog_status.set_label(f"Catalog results {first}–{last}{cache}")
+            self.previous_button.set_sensitive(self.catalog_start > 0)
+            has_next = (
+                len(page.entries) == self.catalog_count
+                if page.total_results < 0
+                else last < page.total_results
+            )
+            self.next_button.set_sensitive(has_next)
+            return GLib.SOURCE_REMOVE
+
+        def _catalog_entry_state(self, entry) -> str:
+            transfer = self.state_store.load_download(entry.id)
+            if transfer:
+                return str(transfer.get("status") or "queued")
+            release = entry.issued[:7]
+            for book in self.books:
+                filename = str(book.get("filename", "")).casefold()
+                if entry.name.casefold() in filename and (not entry.flavour or entry.flavour.casefold() in filename):
+                    if not release or release in filename:
+                        return "installed"
+            return ""
+
+        def _clear_catalog_filters(self, _button) -> None:
+            self.language_filter.set_text("")
+            self.category_filter.set_text("")
+            self.size_filter.set_text("")
+            self.search.set_text("")
+            self.refresh_catalog(reset=True)
+
+        def _catalog_page(self, direction: int) -> None:
+            self.catalog_start = max(0, self.catalog_start + direction * self.catalog_count)
+            self.refresh_catalog()
+
+        def _start_download(self, entry) -> None:
+            self.catalog_status.set_label(f"Preparing {entry.title}…")
+
+            def worker() -> None:
+                try:
+                    destination = Path(load_config()["downloadDir"]).expanduser()
+                    destination.mkdir(parents=True, exist_ok=True)
+                    manager = self._ensure_download_manager()
+                    manager.add_catalog(
+                        entry.id,
+                        entry.downloadUrl,
+                        destination,
+                        expected_size=entry.sizeBytes,
+                        metadata=asdict(entry),
+                    )
+                    state = self.state_store.load_download(entry.id) or {}
+                    state["status"] = "queued"
+                    self.state_store.save_download(entry.id, state)
+                except Exception as error:
+                    GLib.idle_add(self._show_error, "Download could not start", str(error))
+                else:
+                    GLib.idle_add(self._download_started, entry.title)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _download_started(self, title_text: str) -> bool:
+            self.catalog_status.set_label(f"Queued {title_text}")
+            self.refresh_catalog()
+            self.refresh_downloads()
+            return GLib.SOURCE_REMOVE
+
+        def _ensure_download_manager(self) -> DownloadManager:
+            with self.download_lock:
+                if self.download_manager is None:
+                    self.download_manager = DownloadManager(self.state_store)
+                self.download_manager.start()
+                return self.download_manager
+
+        def refresh_downloads(self) -> None:
+            states = self.state_store.list_download_states()
+            clear_children(self.download_list)
+            for state in states:
+                self.download_list.append(DownloadRow(state, self._download_action, self.open_book))
+            active = sum(1 for item in states if item.get("status") in {"queued", "downloading", "paused"})
+            self.download_status.set_label(
+                f"{len(states)} transfers · {active} active or paused" if states else "No downloads"
+            )
+
+        def _poll_downloads(self) -> bool:
+            if self.download_polling:
+                return GLib.SOURCE_CONTINUE
+            states = self.state_store.list_download_states()
+            pending = [
+                item for item in states
+                if item.get("status") not in {"completed", "error", "cancelled"}
+                and item.get("gids")
+            ]
+            if not pending:
+                return GLib.SOURCE_CONTINUE
+            self.download_polling = True
+
+            def worker() -> None:
+                completed = False
+                try:
+                    manager = self._ensure_download_manager()
+                    for state in pending:
+                        previous = state.get("status")
+                        try:
+                            statuses = manager.poll(str(state["catalog_id"]))
+                            if previous != "completed" and statuses and all(
+                                item["status"] == "completed" for item in statuses
+                            ):
+                                completed = True
+                        except Exception as error:
+                            failed = dict(state)
+                            failed["error"] = str(error)
+                            self.state_store.save_download(str(state["catalog_id"]), failed)
+                finally:
+                    GLib.idle_add(self._downloads_polled, completed)
+
+            threading.Thread(target=worker, daemon=True).start()
+            return GLib.SOURCE_CONTINUE
+
+        def _downloads_polled(self, completed: bool) -> bool:
+            self.download_polling = False
+            self.refresh_downloads()
+            if completed:
+                self.refresh_library()
+            return GLib.SOURCE_REMOVE
+
+        def _download_action(self, action: str, catalog_id: str) -> None:
+            if action == "cancel":
+                dialog = Gtk.AlertDialog(
+                    message="Cancel download?",
+                    detail="The partial archive and aria2 control file will be deleted.",
+                    buttons=["Keep Download", "Cancel and Delete"],
+                    cancel_button=0,
+                    default_button=1,
+                )
+                dialog.choose(self, None, self._cancel_download_confirmed, catalog_id)
+                return
+            self._run_download_action(action, catalog_id)
+
+        def _cancel_download_confirmed(self, dialog, result, catalog_id: str) -> None:
+            try:
+                accepted = dialog.choose_finish(result) == 1
+            except GLib.Error:
+                return
+            if accepted:
+                self._run_download_action("cancel", catalog_id)
+
+        def _run_download_action(self, action: str, catalog_id: str) -> None:
+            def worker() -> None:
+                try:
+                    manager = self._ensure_download_manager()
+                    if action == "pause":
+                        manager.pause(catalog_id)
+                    elif action == "resume":
+                        manager.resume(catalog_id)
+                    elif action == "retry":
+                        manager.retry(catalog_id)
+                    elif action == "cancel":
+                        manager.cancel(catalog_id)
+                    if action != "cancel":
+                        manager.poll(catalog_id)
+                except Exception as error:
+                    GLib.idle_add(self._show_error, "Download action failed", str(error))
+                finally:
+                    GLib.idle_add(self.refresh_downloads)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def open_book(self, book: dict) -> None:
+            path = str(book.get("path") or "")
+            if not path:
+                return
+            self.reader_generation += 1
+            generation = self.reader_generation
+            old_server = self.reader_server
+            self.reader_server = None
+            self.mode = "reader"
+            self.stack.set_visible_child_name("reader")
+            self.reader_title.set_label(Path(path).name)
+            self.reader_status.set_label("Starting private reader…")
+
+            def worker() -> None:
+                server = None
+                error = None
+                try:
+                    if old_server:
+                        old_server.stop()
+                    server = ReaderServer(path).start()
+                except Exception as failure:
+                    error = str(failure)
+                GLib.idle_add(self._reader_ready, generation, server, error)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _reader_ready(self, generation: int, server, error: str | None) -> bool:
+            if generation != self.reader_generation:
+                if server:
+                    threading.Thread(target=server.stop, daemon=True).start()
+                return GLib.SOURCE_REMOVE
+            if error or server is None:
+                self.reader_status.set_label(f"READER ERROR · {error}")
+                self.reader_status.add_css_class("error")
+                return GLib.SOURCE_REMOVE
+            self.reader_server = server
+            self.reader_status.remove_css_class("error")
+            self.reader_status.set_label("Offline · localhost only")
+            self.reader.load_uri(server.viewer_url)
+            return GLib.SOURCE_REMOVE
+
+        def _reader_home(self, _button) -> None:
+            if self.reader_server:
+                self.reader.load_uri(self.reader_server.home_url)
+
+        def _leave_reader(self) -> None:
+            self.show_mode("library")
+
+        def _teardown_reader(self, *, synchronous: bool = False) -> None:
+            self.reader_generation += 1
+            server = self.reader_server
+            self.reader_server = None
+            self.reader.load_uri("about:blank")
+            if server:
+                if synchronous:
+                    server.stop()
+                else:
+                    threading.Thread(target=server.stop, daemon=True).start()
+
+        def _reader_policy(self, _view, decision, decision_type) -> bool:
+            if decision_type != WebKit.PolicyDecisionType.NAVIGATION_ACTION:
+                return False
+            uri = decision.get_request().get_uri()
+            parsed = urllib.parse.urlsplit(uri)
+            if parsed.scheme in {"about", "data"}:
+                return False
+            allowed_port = self.reader_server.port if self.reader_server else None
+            if parsed.scheme == "http" and parsed.hostname == "127.0.0.1" and parsed.port == allowed_port:
+                return False
+            if parsed.scheme in {"http", "https"}:
+                decision.ignore()
+                action = decision.get_navigation_action()
+                if action and action.is_user_gesture():
+                    Gio.AppInfo.launch_default_for_uri(uri, None)
+                else:
+                    self.reader_status.set_label("Blocked an automatic external link")
+                return True
+            decision.ignore()
+            return True
+
+        def _reader_load_failed(self, _view, _event, _uri, error) -> bool:
+            self.reader_status.set_label(f"LOAD ERROR · {error.message}")
+            self.reader_status.add_css_class("error")
+            return False
+
+        def _search_changed(self, _entry) -> None:
+            if self.mode == "library":
+                self._refresh_library_filter()
+                return
+            if self.mode != "explore":
+                return
+            if self.search_source:
+                GLib.source_remove(self.search_source)
+            self.search_source = GLib.timeout_add(450, self._search_now)
+
+        def _search_now(self) -> bool:
+            self.search_source = 0
+            if self.mode == "explore":
+                self.refresh_catalog(reset=True)
+            elif self.mode == "library":
+                self._refresh_library_filter()
+            return GLib.SOURCE_REMOVE
+
+        def _show_error(self, title: str, detail: str) -> bool:
+            Gtk.AlertDialog(message=title, detail=detail, buttons=["Close"]).show(self)
+            return GLib.SOURCE_REMOVE
+
+        def _key_pressed(self, _controller, keyval, _keycode, state) -> bool:
+            if state & Gdk.ModifierType.CONTROL_MASK:
+                modes = {Gdk.KEY_1: "library", Gdk.KEY_2: "explore", Gdk.KEY_3: "downloads"}
+                if keyval in modes:
+                    self.show_mode(modes[keyval])
+                    return True
+            if keyval == Gdk.KEY_Escape and self.mode == "reader":
+                self._leave_reader()
+                return True
+            if keyval == Gdk.KEY_slash and self.mode != "reader":
+                self.search.grab_focus()
+                return True
+            return False
+
+        def shutdown(self) -> None:
+            if self.download_timer:
+                GLib.source_remove(self.download_timer)
+                self.download_timer = 0
+            self._teardown_reader(synchronous=True)
+            if self.download_manager:
+                try:
+                    self.download_manager.shutdown()
+                except DownloadError:
+                    pass
+
+    class OmawixApplication(Gtk.Application):
+        def __init__(self):
+            super().__init__(
+                application_id=APP_ID,
+                flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+            )
+            self.window: OmawixWindow | None = None
+            self.provider = Gtk.CssProvider()
+
+        def do_startup(self) -> None:
+            Gtk.Application.do_startup(self)
+            self.provider.load_from_data(theme_css())
+            display = Gdk.Display.get_default()
+            if display:
+                Gtk.StyleContext.add_provider_for_display(
+                    display, self.provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+                )
+
+        def do_activate(self) -> None:
+            self.window = self.window or OmawixWindow(self)
+            self.window.present()
+
+        def do_command_line(self, command_line) -> int:
+            arguments = [str(value) for value in command_line.get_arguments()][1:]
+            open_path = None
+            if "--open" in arguments:
+                index = arguments.index("--open")
+                if index + 1 < len(arguments):
+                    open_path = arguments[index + 1]
+            elif arguments and not arguments[0].startswith("-"):
+                open_path = arguments[0]
+            self.activate()
+            if open_path and self.window:
+                path = resolve_command_line_path(open_path, command_line.get_cwd())
+                self.window.open_book({"path": str(path)})
+            return 0
+
+        def do_shutdown(self) -> None:
+            if self.window:
+                self.window.shutdown()
+            Gtk.Application.do_shutdown(self)
+
+    return OmawixApplication().run(sys.argv)
+
+
+def main() -> int:
+    if "--json" in sys.argv[1:]:
+        print(json.dumps(collect_library(), ensure_ascii=False))
+        return 0
+    return run_gui()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

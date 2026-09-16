@@ -1,0 +1,130 @@
+#!/bin/bash
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+LAUNCHER="$HOME/.local/bin/omawix"
+INSTALL_DIR="$DATA_HOME/omawix"
+INSTALL_MANIFEST="$INSTALL_DIR/install-manifest"
+
+packages=()
+
+add_package() {
+  local candidate existing
+  candidate="$1"
+  for existing in "${packages[@]}"; do
+    [[ "$existing" == "$candidate" ]] && return
+  done
+  packages+=("$candidate")
+}
+
+recorded_hash() {
+  local wanted kind hash path
+  wanted="$1"
+  [[ -f "$INSTALL_MANIFEST" ]] || return 1
+  while IFS=$'\t' read -r kind hash path; do
+    if [[ "$kind" == "file" && "$path" == "$wanted" ]]; then
+      printf '%s\n' "$hash"
+      return 0
+    fi
+  done < "$INSTALL_MANIFEST"
+  return 1
+}
+
+check_owned_destination() {
+  local source destination expected current
+  source="$1"
+  destination="$2"
+  [[ -e "$destination" ]] || return 0
+  if cmp -s "$source" "$destination" && [[ "$install_owned" == true ]]; then
+    return 0
+  fi
+  expected="$(recorded_hash "$destination" || true)"
+  current="$(sha256sum "$destination" | cut -d ' ' -f 1)"
+  if [[ -z "$expected" || "$current" != "$expected" ]]; then
+    printf 'Refusing to replace file not owned by this Omawix installation: %s\n' "$destination" >&2
+    exit 1
+  fi
+}
+
+if ! python3 -c 'import sys; assert sys.version_info >= (3, 11)' >/dev/null 2>&1; then
+  printf 'Omawix requires Python 3.11 or newer.\n' >&2
+  exit 1
+fi
+
+if ! command -v kiwix-serve >/dev/null 2>&1; then
+  add_package kiwix-tools
+fi
+
+if ! command -v aria2c >/dev/null 2>&1; then
+  add_package aria2
+fi
+
+if ! python3 -c 'import gi; gi.require_version("Gtk", "4.0"); from gi.repository import Gtk; assert (Gtk.get_major_version(), Gtk.get_minor_version()) >= (4, 10)' >/dev/null 2>&1; then
+  add_package python-gobject
+  add_package gtk4
+fi
+
+if ! python3 -c 'import gi; gi.require_version("WebKit", "6.0"); from gi.repository import WebKit' >/dev/null 2>&1; then
+  add_package python-gobject
+  add_package webkitgtk-6.0
+fi
+
+if (( ${#packages[@]} > 0 )); then
+  omarchy pkg add "${packages[@]}"
+fi
+
+if ! command -v kiwix-serve >/dev/null 2>&1 || ! command -v aria2c >/dev/null 2>&1; then
+  printf 'Omawix requires kiwix-tools and aria2. Dependency installation did not complete.\n' >&2
+  exit 1
+fi
+
+if ! python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("WebKit", "6.0"); from gi.repository import Gtk, WebKit; assert (Gtk.get_major_version(), Gtk.get_minor_version()) >= (4, 10)' >/dev/null 2>&1; then
+  printf 'Omawix requires Python GI, Gtk 4.10 or newer, and WebKit 6.0.\n' >&2
+  exit 1
+fi
+
+mkdir -p "$HOME/.local/bin" "$DATA_HOME/applications" \
+  "$DATA_HOME/icons/hicolor/scalable/apps" "$DATA_HOME/mime/packages"
+desktop_destination="$DATA_HOME/applications/io.github.stamatim.omawix.desktop"
+icon_destination="$DATA_HOME/icons/hicolor/scalable/apps/io.github.stamatim.omawix.svg"
+mime_destination="$DATA_HOME/mime/packages/io.github.stamatim.omawix.xml"
+install_owned=false
+[[ -f "$INSTALL_MANIFEST" ]] && install_owned=true
+if [[ -e "$LAUNCHER" || -L "$LAUNCHER" ]]; then
+  if [[ ! -L "$LAUNCHER" || "$(readlink -f "$LAUNCHER")" != "$(readlink -f "$HERE/app/omawix")" ]]; then
+    printf 'Refusing to replace existing launcher: %s\n' "$LAUNCHER" >&2
+    exit 1
+  fi
+  install_owned=true
+fi
+check_owned_destination "$HERE/app/io.github.stamatim.omawix.desktop" "$desktop_destination"
+check_owned_destination "$HERE/app/io.github.stamatim.omawix.svg" "$icon_destination"
+check_owned_destination "$HERE/app/io.github.stamatim.omawix-mime.xml" "$mime_destination"
+ln -sfn "$HERE/app/omawix" "$LAUNCHER"
+install -Dm644 "$HERE/app/io.github.stamatim.omawix.desktop" \
+  "$desktop_destination"
+install -Dm644 "$HERE/app/io.github.stamatim.omawix.svg" \
+  "$icon_destination"
+install -Dm644 "$HERE/app/io.github.stamatim.omawix-mime.xml" \
+  "$mime_destination"
+
+mkdir -p -m 700 "$INSTALL_DIR"
+chmod 700 "$INSTALL_DIR"
+manifest_tmp="$(mktemp "$INSTALL_DIR/install-manifest.XXXXXX")"
+chmod 600 "$manifest_tmp"
+{
+  printf 'source\t-\t%s\n' "$HERE/app/omawix"
+  printf 'file\t%s\t%s\n' "$(sha256sum "$desktop_destination" | cut -d ' ' -f 1)" "$desktop_destination"
+  printf 'file\t%s\t%s\n' "$(sha256sum "$icon_destination" | cut -d ' ' -f 1)" "$icon_destination"
+  printf 'file\t%s\t%s\n' "$(sha256sum "$mime_destination" | cut -d ' ' -f 1)" "$mime_destination"
+} > "$manifest_tmp"
+mv -f "$manifest_tmp" "$INSTALL_MANIFEST"
+
+command -v update-desktop-database >/dev/null 2>&1 \
+  && update-desktop-database "$DATA_HOME/applications" >/dev/null 2>&1 || true
+command -v update-mime-database >/dev/null 2>&1 \
+  && update-mime-database "$DATA_HOME/mime" >/dev/null 2>&1 || true
+
+printf '\nOmawix is installed. Launch it with: omawix\n'
+printf 'The Omarchy plugin can be enabled with: omarchy plugin enable io.github.stamatim.omawix\n'

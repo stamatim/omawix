@@ -1,0 +1,64 @@
+#!/bin/bash
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+LAUNCHER="$HOME/.local/bin/omawix"
+INSTALL_MANIFEST="$DATA_HOME/omawix/install-manifest"
+
+recorded_value() {
+  local wanted kind value path
+  wanted="$1"
+  [[ -f "$INSTALL_MANIFEST" ]] || return 1
+  while IFS=$'\t' read -r kind value path; do
+    if [[ "$kind" == "$wanted" && ( "$wanted" == "source" || "$path" == "$2" ) ]]; then
+      if [[ "$wanted" == "source" ]]; then
+        printf '%s\n' "$path"
+      else
+        printf '%s\n' "$value"
+      fi
+      return 0
+    fi
+  done < "$INSTALL_MANIFEST"
+  return 1
+}
+
+remove_owned_file() {
+  local destination source expected current
+  destination="$1"
+  source="$2"
+  [[ -e "$destination" ]] || return 0
+  expected="$(recorded_value file "$destination" || true)"
+  current="$(sha256sum "$destination" | cut -d ' ' -f 1)"
+  if [[ -n "$expected" && "$current" == "$expected" ]]; then
+    rm "$destination"
+  elif [[ -z "$expected" && -f "$source" ]] && cmp -s "$source" "$destination"; then
+    rm "$destination"
+  else
+    printf 'Preserving modified or unowned file: %s\n' "$destination" >&2
+  fi
+}
+
+installed_source="$(recorded_value source "" || true)"
+if [[ -L "$LAUNCHER" ]]; then
+  literal_target="$(readlink "$LAUNCHER")"
+  canonical_target="$(readlink -f "$LAUNCHER" 2>/dev/null || true)"
+  current_source="$(readlink -f "$HERE/app/omawix")"
+  if [[ "$literal_target" == "$installed_source" || "$canonical_target" == "$current_source" ]]; then
+    rm "$LAUNCHER"
+  fi
+fi
+remove_owned_file "$DATA_HOME/applications/io.github.stamatim.omawix.desktop" \
+  "$HERE/app/io.github.stamatim.omawix.desktop"
+remove_owned_file "$DATA_HOME/icons/hicolor/scalable/apps/io.github.stamatim.omawix.svg" \
+  "$HERE/app/io.github.stamatim.omawix.svg"
+remove_owned_file "$DATA_HOME/mime/packages/io.github.stamatim.omawix.xml" \
+  "$HERE/app/io.github.stamatim.omawix-mime.xml"
+rm -f "$INSTALL_MANIFEST"
+
+command -v update-desktop-database >/dev/null 2>&1 \
+  && update-desktop-database "$DATA_HOME/applications" >/dev/null 2>&1 || true
+command -v update-mime-database >/dev/null 2>&1 \
+  && update-mime-database "$DATA_HOME/mime" >/dev/null 2>&1 || true
+
+printf 'Removed the Omawix desktop app. ZIM files, configuration, catalog/download data, and download state were preserved.\n'

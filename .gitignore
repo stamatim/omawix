@@ -1,0 +1,55 @@
+# Python and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.tox/
+.nox/
+.cache/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+.env*
+!.env.example
+
+# Runtime data and downloads
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.db
+*.db-shm
+*.db-wal
+aria2.session
+*.aria2
+*.meta4
+*.zim
+*.ZIM
+*.zim[a-zA-Z][a-zA-Z]
+*.ZIM[a-zA-Z][a-zA-Z]
+
+# Coverage and build artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+.eggs/
+node_modules/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
